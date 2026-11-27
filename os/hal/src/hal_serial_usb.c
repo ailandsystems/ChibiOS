@@ -78,6 +78,41 @@ static bool sdu_start_receive(SerialUSBDriver *sdup) {
   return false;
 }
 
+/* OUT-endpoint wedge watchdog state, used by sduSOFHookI(). Kept in a small
+   file-static table keyed by driver pointer so the shared SerialUSBDriver
+   struct (a public ChibiOS header) does not have to change. One slot per
+   serial-over-USB driver; a board has very few.*/
+#define SDU_OUT_REARM_STUCK_SLOTS   4
+/* Consecutive SOFs (~1 ms each) the OUT endpoint may stay un-armable with a
+   full input queue before the queue is reclaimed. ~0.5 s is far longer than
+   any legitimate transient backpressure, so in-flight bytes are not discarded
+   during normal flow control.*/
+#define SDU_OUT_REARM_STUCK_LIMIT   500U
+
+static struct {
+  SerialUSBDriver *sdup;
+  uint16_t         cnt;
+} sdu_out_rearm_stuck[SDU_OUT_REARM_STUCK_SLOTS];
+
+static uint16_t *sdu_out_rearm_stuck_slot(SerialUSBDriver *sdup) {
+  int i, freeidx = -1;
+
+  for (i = 0; i < SDU_OUT_REARM_STUCK_SLOTS; i++) {
+    if (sdu_out_rearm_stuck[i].sdup == sdup) {
+      return &sdu_out_rearm_stuck[i].cnt;
+    }
+    if ((freeidx < 0) && (sdu_out_rearm_stuck[i].sdup == NULL)) {
+      freeidx = i;
+    }
+  }
+  if (freeidx >= 0) {
+    sdu_out_rearm_stuck[freeidx].sdup = sdup;
+    sdu_out_rearm_stuck[freeidx].cnt  = 0;
+    return &sdu_out_rearm_stuck[freeidx].cnt;
+  }
+  return NULL;
+}
+
 /*
  * Interface implementation.
  */
@@ -411,6 +446,40 @@ void sduSOFHookI(SerialUSBDriver *sdup) {
   if ((usbGetDriverStateI(sdup->config->usbp) != USB_ACTIVE) ||
       (sdup->state != SDU_READY)) {
     return;
+  }
+
+  /* OUT (receive) endpoint wedge watchdog.
+
+     The normal OUT re-arm is edge-triggered (ibnotify on buffer release, or
+     sduDataReceived on transfer completion). Under sustained host->device
+     backpressure the OUT endpoint can end a transfer de-armed with the input
+     queue full and that edge never firing again: the endpoint then NAKs every
+     host OUT token forever and all host->device traffic wedges until a full
+     core reset (observed on STM32H7 OTG under USB passthrough backpressure).
+
+     sdu_start_receive() re-arms whenever a free buffer exists, so calling it
+     here every SOF (1 kHz) covers a plain missed edge. If it still cannot arm
+     because the queue is full, and that persists, the datapath is wedged:
+     reclaim the input queue (discarding the stuck, undeliverable bytes) and
+     re-arm, which is the only escape short of a core reset.*/
+  if (sdu_start_receive(sdup)) {
+    uint16_t *stuck = sdu_out_rearm_stuck_slot(sdup);
+    if ((stuck != NULL) &&
+        ibqIsFullI(&sdup->ibqueue) &&
+        !usbGetReceiveStatusI(sdup->config->usbp, sdup->config->bulk_out)) {
+      if (++(*stuck) >= SDU_OUT_REARM_STUCK_LIMIT) {
+        *stuck = 0;
+        ibqResetI(&sdup->ibqueue);
+        (void) sdu_start_receive(sdup);
+      }
+    } else if (stuck != NULL) {
+      *stuck = 0;
+    }
+  } else {
+    uint16_t *stuck = sdu_out_rearm_stuck_slot(sdup);
+    if (stuck != NULL) {
+      *stuck = 0;
+    }
   }
 
   /* If there is already a transaction ongoing then another one cannot be
